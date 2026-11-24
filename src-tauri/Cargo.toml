@@ -1,16 +1,12 @@
+
 [package]
 name = "netwarga"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Net Warga - Network Management System"
+authors = ["Net Warga"]
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "netwarga_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -20,11 +16,21 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Database
+rusqlite = { version = "0.37", features = ["bundled"] }
 
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# Async runtime and networking
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "macros"] }
+
+# Error handling
+thiserror = "2"
+num-bigint = "0.5.1"
+num-traits = "0.2.19"
+
 [profile.release]
 codegen-units = 1
 lto = true
