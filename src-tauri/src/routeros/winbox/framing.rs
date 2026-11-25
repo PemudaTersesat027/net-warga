@@ -4,6 +4,10 @@ pub const TAG_PLAINTEXT: u8 = 0x01;
 pub const TAG_ENCRYPTED: u8 = 0x06;
 pub const TAG_CONTINUATION: u8 = 0xFF;
 
+/// Application safety limit for the complete encoded frame, including chunk
+/// headers. This is not a limit specified by a verified RouterOS reference.
+pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkedFrame {
     pub tag: u8,
@@ -51,7 +55,10 @@ impl fmt::Display for FrameError {
                 f,
                 "truncated chunk at byte offset {offset}: declared {declared_len} bytes, only {available} available"
             ),
-            Self::FrameTooLarge => write!(f, "decoded frame exceeds the supported size"),
+            Self::FrameTooLarge => write!(
+                f,
+                "Winbox frame exceeds the application limit of {MAX_FRAME_SIZE} bytes"
+            ),
         }
     }
 }
@@ -111,6 +118,10 @@ pub fn decode_chunked_frame(input: &[u8]) -> Result<(ChunkedFrame, usize), Frame
             .checked_add(chunk_len)
             .ok_or(FrameError::FrameTooLarge)?;
 
+        if data_end > MAX_FRAME_SIZE {
+            return Err(FrameError::FrameTooLarge);
+        }
+
         if data_end > input.len() {
             return Err(FrameError::TruncatedChunk {
                 offset,
@@ -143,6 +154,7 @@ pub fn decode_chunked_frame(input: &[u8]) -> Result<(ChunkedFrame, usize), Frame
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameEncodeError {
     InvalidFirstTag(u8),
+    FrameTooLarge { actual: usize, maximum: usize },
 }
 
 impl std::fmt::Display for FrameEncodeError {
@@ -150,6 +162,12 @@ impl std::fmt::Display for FrameEncodeError {
         match self {
             Self::InvalidFirstTag(tag) => {
                 write!(f, "Invalid first chunk tag: 0x{tag:02X}")
+            }
+            Self::FrameTooLarge { actual, maximum } => {
+                write!(
+                    f,
+                    "Winbox frame is too large: {actual} bytes (maximum {maximum})"
+                )
             }
         }
     }
@@ -180,8 +198,22 @@ pub fn encode_chunked_frame(payload: &[u8], first_tag: u8) -> Result<Vec<u8>, Fr
 
     let needs_empty_terminator = !payload.is_empty() && payload.len().is_multiple_of(255);
 
-    let total_chunks = chunk_count + usize::from(needs_empty_terminator);
-    let mut output = Vec::with_capacity(payload.len() + total_chunks * 2);
+    let total_chunks = chunk_count
+        .checked_add(usize::from(needs_empty_terminator))
+        .unwrap_or(usize::MAX);
+    let encoded_length = total_chunks
+        .checked_mul(2)
+        .and_then(|headers| payload.len().checked_add(headers))
+        .unwrap_or(usize::MAX);
+
+    if encoded_length > MAX_FRAME_SIZE {
+        return Err(FrameEncodeError::FrameTooLarge {
+            actual: encoded_length,
+            maximum: MAX_FRAME_SIZE,
+        });
+    }
+
+    let mut output = Vec::with_capacity(encoded_length);
 
     if payload.is_empty() {
         output.push(0);
@@ -350,7 +382,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn terminates_exact_multiple_of_255() {
         let payload = vec![0xBB; 510];
 
@@ -375,6 +406,38 @@ mod tests {
         let result = encode_chunked_frame(&[0xAA], 0x99);
 
         assert_eq!(result, Err(FrameEncodeError::InvalidFirstTag(0x99)));
+    }
+
+    #[test]
+    fn rejects_frame_over_application_size_limit() {
+        let mut input = Vec::with_capacity(MAX_FRAME_SIZE + 257);
+        let mut first_chunk = true;
+
+        while input.len() <= MAX_FRAME_SIZE {
+            input.push(u8::MAX);
+            input.push(if first_chunk {
+                TAG_PLAINTEXT
+            } else {
+                TAG_CONTINUATION
+            });
+            input.extend_from_slice(&[0; u8::MAX as usize]);
+            first_chunk = false;
+        }
+
+        assert_eq!(decode_chunked_frame(&input), Err(FrameError::FrameTooLarge));
+    }
+
+    #[test]
+    fn encoder_rejects_frame_over_application_size_limit() {
+        let payload = vec![0xAA; MAX_FRAME_SIZE];
+
+        assert_eq!(
+            encode_chunked_frame(&payload, TAG_PLAINTEXT),
+            Err(FrameEncodeError::FrameTooLarge {
+                actual: MAX_FRAME_SIZE + (MAX_FRAME_SIZE / 255 + 1) * 2,
+                maximum: MAX_FRAME_SIZE,
+            })
+        );
     }
 
     #[test]

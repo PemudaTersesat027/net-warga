@@ -7,8 +7,8 @@ use tokio::time::timeout;
 
 use super::encoder::{EncodeError, TlvRecord, encode_m2_message};
 use super::framing::{
-    ChunkedFrame, FrameEncodeError, FrameError, TAG_ENCRYPTED, TAG_PLAINTEXT, decode_chunked_frame,
-    encode_chunked_frame,
+    ChunkedFrame, FrameEncodeError, FrameError, MAX_FRAME_SIZE, TAG_CONTINUATION, TAG_ENCRYPTED,
+    TAG_PLAINTEXT, decode_chunked_frame, encode_chunked_frame,
 };
 
 const DEFAULT_WINBOX_PORT: u16 = 8291;
@@ -22,6 +22,8 @@ pub enum WinboxSessionError {
     FrameEncode(FrameEncodeError),
     MessageEncode(EncodeError),
     InvalidFrame,
+    MalformedFrame(&'static str),
+    TruncatedFrame(&'static str),
 }
 
 impl std::fmt::Display for WinboxSessionError {
@@ -36,7 +38,13 @@ impl std::fmt::Display for WinboxSessionError {
             Self::MessageEncode(error) => {
                 write!(f, "Winbox message encoding error: {error}")
             }
-            Self::InvalidFrame => write!(f, "Invalid or incomplete Winbox frame"),
+            Self::InvalidFrame => write!(f, "Malformed or incomplete Winbox frame"),
+            Self::MalformedFrame(reason) => {
+                write!(f, "Malformed Winbox frame: {reason}")
+            }
+            Self::TruncatedFrame(part) => {
+                write!(f, "Truncated Winbox frame while reading {part}")
+            }
         }
     }
 }
@@ -136,55 +144,80 @@ impl WinboxSession {
 
     /// Membaca satu frame lengkap dari TCP stream.
     ///
-    /// Pembacaan dilakukan berdasarkan panjang setiap chunk.
+    /// The timeout applies to the entire frame, not to each individual read.
+    /// The frame-size cap is an application safety limit, not a protocol limit.
     pub async fn receive_frame(&mut self) -> Result<ChunkedFrame, WinboxSessionError> {
-        let mut frame_bytes = Vec::new();
-        let mut first_chunk = true;
+        timeout(self.timeout, async {
+            let mut frame_bytes = Vec::new();
+            let mut first_chunk = true;
 
-        loop {
-            let mut header = [0u8; 2];
+            loop {
+                let mut header = [0u8; 2];
 
-            timeout(self.timeout, self.stream.read_exact(&mut header))
-                .await
-                .map_err(|_| WinboxSessionError::Timeout)??;
-
-            let chunk_length = header[0] as usize;
-            let chunk_tag = header[1];
-
-            if first_chunk {
-                if chunk_tag != TAG_PLAINTEXT && chunk_tag != TAG_ENCRYPTED {
-                    return Err(WinboxSessionError::InvalidFrame);
+                match self.stream.read_exact(&mut header).await {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                        return Err(WinboxSessionError::TruncatedFrame("chunk header"));
+                    }
+                    Err(error) => return Err(WinboxSessionError::Io(error)),
                 }
-                first_chunk = false;
-            } else if chunk_tag != super::framing::TAG_CONTINUATION {
+
+                let chunk_length = header[0] as usize;
+                let chunk_tag = header[1];
+                let next_frame_length = frame_bytes
+                    .len()
+                    .checked_add(header.len())
+                    .and_then(|length| length.checked_add(chunk_length))
+                    .unwrap_or(usize::MAX);
+
+                if next_frame_length > MAX_FRAME_SIZE {
+                    return Err(WinboxSessionError::Frame(FrameError::FrameTooLarge));
+                }
+
+                if first_chunk {
+                    if chunk_tag != TAG_PLAINTEXT && chunk_tag != TAG_ENCRYPTED {
+                        return Err(WinboxSessionError::MalformedFrame(
+                            "unsupported first chunk tag",
+                        ));
+                    }
+                    first_chunk = false;
+                } else if chunk_tag != TAG_CONTINUATION {
+                    return Err(WinboxSessionError::MalformedFrame(
+                        "invalid continuation chunk tag",
+                    ));
+                }
+
+                frame_bytes.extend_from_slice(&header);
+                let mut chunk_payload = vec![0u8; chunk_length];
+
+                if chunk_length > 0 {
+                    match self.stream.read_exact(&mut chunk_payload).await {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Err(WinboxSessionError::TruncatedFrame("chunk payload"));
+                        }
+                        Err(error) => return Err(WinboxSessionError::Io(error)),
+                    }
+
+                    frame_bytes.extend_from_slice(&chunk_payload);
+                }
+
+                // 255 means another chunk follows (existing assumed wire layout).
+                if chunk_length < u8::MAX as usize {
+                    break;
+                }
+            }
+
+            let (frame, consumed) = decode_chunked_frame(&frame_bytes)?;
+
+            if consumed != frame_bytes.len() {
                 return Err(WinboxSessionError::InvalidFrame);
             }
 
-            frame_bytes.extend_from_slice(&header);
-
-            let mut chunk_payload = vec![0u8; chunk_length];
-
-            if chunk_length > 0 {
-                timeout(self.timeout, self.stream.read_exact(&mut chunk_payload))
-                    .await
-                    .map_err(|_| WinboxSessionError::Timeout)??;
-
-                frame_bytes.extend_from_slice(&chunk_payload);
-            }
-
-            // 255 berarti masih ada chunk berikutnya.
-            if chunk_length < 255 {
-                break;
-            }
-        }
-
-        let (frame, consumed) = decode_chunked_frame(&frame_bytes)?;
-
-        if consumed != frame_bytes.len() {
-            return Err(WinboxSessionError::InvalidFrame);
-        }
-
-        Ok(frame)
+            Ok(frame)
+        })
+        .await
+        .map_err(|_| WinboxSessionError::Timeout)?
     }
 
     pub async fn close(mut self) -> Result<(), WinboxSessionError> {
@@ -293,5 +326,136 @@ mod tests {
 
         server.await.unwrap();
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_frame_times_out_for_the_whole_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut first_chunk = vec![u8::MAX, TAG_PLAINTEXT];
+            first_chunk.extend_from_slice(&[0xAA; u8::MAX as usize]);
+            socket.write_all(&first_chunk).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let mut second_chunk = vec![u8::MAX, TAG_CONTINUATION];
+            second_chunk.extend_from_slice(&[0xBB; u8::MAX as usize]);
+            let _ = socket.write_all(&second_chunk).await;
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = socket.write_all(&[0, TAG_CONTINUATION]).await;
+        });
+
+        let mut session = WinboxSession::connect(
+            "127.0.0.1",
+            Some(address.port()),
+            Some(Duration::from_millis(200)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            session.receive_frame().await,
+            Err(WinboxSessionError::Timeout)
+        ));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_frame_reports_malformed_first_tag() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&[0, 0x77]).await.unwrap();
+        });
+
+        let mut session = WinboxSession::connect(
+            "127.0.0.1",
+            Some(address.port()),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            session.receive_frame().await,
+            Err(WinboxSessionError::MalformedFrame(
+                "unsupported first chunk tag"
+            ))
+        ));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_frame_reports_truncated_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&[3, TAG_PLAINTEXT, 0xAA]).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let mut session = WinboxSession::connect(
+            "127.0.0.1",
+            Some(address.port()),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            session.receive_frame().await,
+            Err(WinboxSessionError::TruncatedFrame("chunk payload"))
+        ));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_frame_rejects_frame_over_application_size_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut frame_bytes = Vec::with_capacity(MAX_FRAME_SIZE + 257);
+            let mut first_chunk = true;
+
+            while frame_bytes.len() <= MAX_FRAME_SIZE {
+                frame_bytes.push(u8::MAX);
+                frame_bytes.push(if first_chunk {
+                    TAG_PLAINTEXT
+                } else {
+                    TAG_CONTINUATION
+                });
+                frame_bytes.extend_from_slice(&[0xAA; u8::MAX as usize]);
+                first_chunk = false;
+            }
+
+            let _ = socket.write_all(&frame_bytes).await;
+        });
+
+        let mut session = WinboxSession::connect(
+            "127.0.0.1",
+            Some(address.port()),
+            Some(Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            session.receive_frame().await,
+            Err(WinboxSessionError::Frame(FrameError::FrameTooLarge))
+        ));
+
+        server.await.unwrap();
     }
 }

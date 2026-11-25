@@ -18,7 +18,7 @@ const WEIERSTRASS_A_HEX: &str =
     "2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa984914a144";
 
 const WEIERSTRASS_B_HEX: &str =
-    "7b425ed097b425ed097b425ed097b425ed097b4260b5e9c7710c864";
+    "7b425ed097b425ed097b425ed097b425ed097b425ed097b4260b5e9c7710c864";
 
 const GROUP_ORDER_HEX: &str =
     "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed";
@@ -107,6 +107,7 @@ fn field_value_to_bytes(value: &BigUint) -> [u8; FIELD_BYTES] {
     let start = FIELD_BYTES - bytes.len();
 
     output[start..].copy_from_slice(&bytes);
+
     output
 }
 
@@ -124,7 +125,7 @@ impl MontgomeryPublicKey {
         Ok(Self { x, parity })
     }
 
-    /// Parses the wire representation:
+    /// Wire representation:
     /// [x: 32 bytes big-endian][parity: 1 byte]
     pub fn from_wire(input: &[u8]) -> Result<Self, CurveError> {
         if input.len() != FIELD_BYTES + 1 {
@@ -146,7 +147,7 @@ impl MontgomeryPublicKey {
         output
     }
 
-    /// Converts Montgomery X to Weierstrass X.
+    /// Converts Montgomery X to short Weierstrass X.
     ///
     /// xW = xM + A/3 (mod p)
     pub fn to_weierstrass(
@@ -165,7 +166,7 @@ impl MontgomeryPublicKey {
 }
 
 impl WeierstrassPublicCoordinate {
-    /// Converts Weierstrass X back to Montgomery X.
+    /// Converts short Weierstrass X back to Montgomery X.
     ///
     /// xM = xW - A/3 (mod p)
     pub fn to_montgomery(
@@ -177,7 +178,6 @@ impl WeierstrassPublicCoordinate {
 
         let x_w = bytes_to_field_value(&self.x)?;
         let p = field_prime();
-
         let offset = montgomery_a_div_3();
 
         let x_m = if x_w >= offset {
@@ -186,10 +186,10 @@ impl WeierstrassPublicCoordinate {
             x_w + &p - offset
         };
 
-        Ok(MontgomeryPublicKey {
-            x: field_value_to_bytes(&x_m),
-            parity: self.parity,
-        })
+        MontgomeryPublicKey::new(
+            field_value_to_bytes(&x_m),
+            self.parity,
+        )
     }
 }
 
@@ -227,6 +227,26 @@ mod tests {
     fn validates_weierstrass_parameters() {
         assert!(!weierstrass_a().is_zero());
         assert!(!weierstrass_b().is_zero());
+
+        assert_eq!(weierstrass_a().bits(), 254);
+        assert_eq!(weierstrass_b().bits(), 255);
+    }
+
+    #[test]
+    fn validates_weierstrass_coefficients() {
+        assert_eq!(
+            weierstrass_a(),
+            parse_hex(
+                "2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa984914a144"
+            )
+        );
+
+        assert_eq!(
+            weierstrass_b(),
+            parse_hex(
+                "7b425ed097b425ed097b425ed097b425ed097b425ed097b4260b5e9c7710c864"
+            )
+        );
     }
 
     #[test]
@@ -263,6 +283,30 @@ mod tests {
         let restored = weierstrass.to_montgomery().unwrap();
 
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn validates_generator_curve_equation() {
+        let key = generator_key();
+        let converted = key.to_weierstrass().unwrap();
+
+        let p = field_prime();
+        let x_m = BigUint::from(9u8);
+        let x_w = BigUint::from_bytes_be(&converted.x);
+
+        let montgomery_rhs = (
+            &x_m * &x_m * &x_m
+                + BigUint::from(486662u32) * &x_m * &x_m
+                + &x_m
+        ) % &p;
+
+        let weierstrass_rhs = (
+            &x_w * &x_w * &x_w
+                + weierstrass_a() * &x_w
+                + weierstrass_b()
+        ) % &p;
+
+        assert_eq!(montgomery_rhs, weierstrass_rhs);
     }
 
     #[test]

@@ -24,15 +24,17 @@ export default function LoginPage() {
 
   const deviceKey = (device) => device.macAddress || device.sourceIp;
 
-  const startDiscovery = useCallback(async () => {
-    setError("");
+  const startDiscovery = useCallback(async (isActive = () => true) => {
+    if (isActive()) setError("");
 
     try {
       await invoke("start_discovery");
-      setScanning(true);
+      if (isActive()) setScanning(true);
     } catch (err) {
-      setScanning(false);
-      setError(String(err));
+      if (isActive()) {
+        setScanning(false);
+        setError(String(err));
+      }
     }
   }, []);
 
@@ -51,12 +53,15 @@ export default function LoginPage() {
 
   useEffect(() => {
     let unlisten;
-    let mounted = true;
+    let disposed = false;
+    let discoveryStart;
+
+    const stopDiscovery = () => invoke("stop_discovery").catch(() => {});
 
     const initialize = async () => {
       try {
-        unlisten = await listen("discovery://device", (event) => {
-          if (!mounted) return;
+        const removeListener = await listen("discovery://device", (event) => {
+          if (disposed) return;
 
           const { device, eventType } = event.payload;
           const key = deviceKey(device);
@@ -86,20 +91,28 @@ export default function LoginPage() {
           });
         });
 
-        if (mounted) {
-          await startDiscovery();
+        if (disposed) {
+          removeListener();
+          return;
         }
+
+        unlisten = removeListener;
+        discoveryStart = startDiscovery(() => !disposed);
+        await discoveryStart;
       } catch (err) {
-        if (mounted) setError(String(err));
+        if (!disposed) setError(String(err));
       }
     };
 
     initialize();
 
     return () => {
-      mounted = false;
+      disposed = true;
       unlisten?.();
-      invoke("stop_discovery").catch(console.error);
+
+      if (discoveryStart) {
+        void discoveryStart.then(stopDiscovery, stopDiscovery);
+      }
     };
   }, [startDiscovery]);
 
@@ -144,12 +157,6 @@ export default function LoginPage() {
 
     try {
       // TODO: Integrasikan dengan RouterClient di Rust.
-      console.log({
-        address: selectedRouter.ipv4Address || selectedRouter.sourceIp,
-        username,
-        password,
-      });
-
       setError("RouterOS authentication belum diintegrasikan.");
     } finally {
       setLoading(false);
